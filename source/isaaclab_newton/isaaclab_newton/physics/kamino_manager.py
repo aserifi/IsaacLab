@@ -14,7 +14,6 @@ from newton import Model, eval_fk
 from newton.solvers import SolverKamino
 
 from isaaclab.physics import PhysicsManager
-from isaaclab.utils.timer import Timer
 
 from .kamino_manager_cfg import KaminoSolverCfg
 from .newton_manager import NewtonManager
@@ -35,25 +34,16 @@ class NewtonKaminoManager(NewtonManager):
 
     @classmethod
     def _forward_kamino(cls, world_mask: wp.array | None = None) -> None:
-        """Reconcile body poses with the current joint configuration via the solver reset.
+        """Reconcile body poses with the joint configuration via the solver reset.
 
-        The reset mode is chosen from the solver's ``use_fk_solver`` config:
-
-        * ``use_fk_solver=True``: pass the written ``joint_q`` / ``joint_u`` so Kamino runs its
-          Gauss-Newton FK solve, producing a consistent ``body_q`` for arbitrary (e.g.
-          randomized) joint reset targets. Efficient for open-chain (tree) assets.
-        * ``use_fk_solver=False``: reset to the assembled model-default reference (no joint
-          targets), which restores the spawn configuration regardless of the current pose.
-          This is the scalable, FK-free path for assets pinned to the assembled
-          configuration (e.g. closed-loop mechanisms like DR Legs).
-
-        With an all-``False`` (or ``None``) ``world_mask`` the reset is a no-op, so this is safe
-        to call unconditionally every step -- mirroring the masked ``eval_fk`` pattern used by
-        the minimal-coordinate solvers.
+        With ``use_fk_solver=True`` the written joint coordinates are passed so Kamino runs its
+        FK solve (handling arbitrary joint targets); otherwise the worlds are reset to the
+        assembled model-default reference. Masked by ``world_mask``, so it is a no-op when no
+        world is flagged and safe to call every step.
 
         Args:
-            world_mask: Per-world mask indicating which worlds to reconcile.
-                Shape ``(num_worlds,)``, dtype ``wp.bool``. If None, reconciles all worlds.
+            world_mask: Per-world reset mask, shape ``(num_worlds,)``, dtype ``wp.bool``.
+                If None, all worlds are reconciled.
         """
         use_fk = bool(getattr(getattr(cls._solver, "_config", None), "use_fk_solver", False))
         if use_fk:
@@ -68,20 +58,18 @@ class NewtonKaminoManager(NewtonManager):
 
     @classmethod
     def forward(cls) -> None:
-        """Update kinematics without stepping physics.
+        """Reconcile reset-flagged worlds without stepping physics.
 
-        Reconciles the worlds flagged by :meth:`invalidate_fk` through the solver reset (a
-        no-op when none are flagged), so the explicit-reset path (``env.reset()`` ->
-        ``sim.forward()``) makes ``body_q`` consistent before observations are read. For
-        tree (non-closed-loop) assets, Newton's generic ``eval_fk`` additionally refreshes
-        body poses from the joint coordinates.
+        Runs the masked solver reset (a no-op when nothing is flagged) so the explicit-reset
+        path (``env.reset()`` -> ``sim.forward()``) makes ``body_q`` consistent before
+        observations are read. Tree assets additionally get a generic ``eval_fk`` refresh.
         """
         cls._forward_kamino(world_mask=cls._world_reset_mask)
         if cls._world_reset_mask is not None:
             cls._world_reset_mask.zero_()
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
-        # Closed-loop body poses are owned by the solver
+        # Closed-loop body poses are owned by the solver.
         if not cls._has_loop_joints:
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
 
@@ -92,8 +80,7 @@ class NewtonKaminoManager(NewtonManager):
         if sim is None or not sim.is_playing():
             return
 
-        # Reconcile any worlds flagged for reset through the solver. The reset is world-masked
-        # and idempotent, so this is a no-op on steps where no reset occurred.
+        # Reconcile reset-flagged worlds (masked, so a no-op when no reset occurred).
         cls._forward_kamino(world_mask=cls._world_reset_mask)
 
         # Notify solver of model changes
@@ -103,28 +90,22 @@ class NewtonKaminoManager(NewtonManager):
                     cls._solver.notify_model_changed(change)
                 NewtonManager._model_changes = set()
 
-        # Lazy CUDA graph capture: deferred from initialize_solver() when RTX was active.
-        # By the time step() is first called, RTX has fully initialized (all cudaImportExternalMemory
-        # calls are done) and is idle between render frames — giving us a clean capture window.
+        # Lazy CUDA graph capture deferred from initialize_solver() when RTX was active: by the
+        # first step() RTX is initialized and idle, giving a clean capture window.
         cfg = PhysicsManager._cfg
         device = PhysicsManager._device
         if cls._graph_capture_pending and cfg is not None and cfg.use_cuda_graph and "cuda" in device:  # type: ignore[union-attr]
             NewtonManager._graph_capture_pending = False
             NewtonManager._graph = cls._capture_relaxed_graph(device)
             if cls._graph is not None:
-                # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
-                # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
-                # first step() inside graph capture. Replay once to pin those
-                # memory-pool addresses before any eager solver.reset() call.
+                # Replay once to pin the buffers StateKamino.from_newton() lazily allocated
+                # during capture before any eager solver.reset() reads them.
                 wp.capture_launch(cls._graph)
                 logger.info("Newton CUDA graph captured (deferred relaxed mode, RTX-compatible)")
             else:
                 logger.warning("Newton deferred CUDA graph capture failed; using eager execution")
 
-        # Ensure body_q is up-to-date before collision detection.
-        # After env resets, joint_q is written but body_q (used by
-        # broadphase/narrowphase) is stale until FK runs.
-        # Only runs FK for dirtied articulations via the accumulated mask.
+        # Refresh body_q for the collision pipeline on dirtied (tree) articulations.
         if cls._needs_collision_pipeline and not cls._has_loop_joints:
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_reset_mask)
 
@@ -150,14 +131,10 @@ class NewtonKaminoManager(NewtonManager):
     def _build_solver(cls, model: Model, solver_cfg: KaminoSolverCfg) -> None:
         """Construct :class:`SolverKamino` and populate the base-class slots.
 
-        Sets :attr:`NewtonManager._needs_collision_pipeline` to ``True`` only
-        when ``use_collision_detector=False`` (Kamino's internal detector
-        handles contacts otherwise).
-
-        Applies :attr:`KaminoSolverCfg.max_contacts_per_world`, when set, by overriding
-        ``model.rigid_contact_max`` before solver construction. This bounds GPU memory
-        for contact-rich multi-env training that would otherwise over-allocate from
-        ``geoms.world_minimum_contacts``.
+        Sets :attr:`NewtonManager._needs_collision_pipeline` from ``use_collision_detector``
+        (Kamino's internal detector handles contacts otherwise), applies
+        :attr:`KaminoSolverCfg.max_contacts_per_world` to bound ``model.rigid_contact_max``,
+        and detects closed-loop articulations for :attr:`_has_loop_joints`.
         """
         if solver_cfg.max_contacts_per_world is not None:
             model.rigid_contact_max = int(solver_cfg.max_contacts_per_world) * model.world_count
@@ -180,36 +157,3 @@ class NewtonKaminoManager(NewtonManager):
             _art_end_np = _art_end.numpy()
             if _art_end_np.shape[0] > 0:
                 cls._has_loop_joints = bool((_art_start_np[1:] > _art_end_np).any())
-
-    @classmethod
-    def _capture_or_defer_cuda_graph(cls) -> None:
-        """Capture the physics CUDA graph, or defer if RTX is initializing."""
-        cfg = PhysicsManager._cfg
-        device = PhysicsManager._device
-        use_cuda_graph = cfg is not None and cfg.use_cuda_graph and "cuda" in device  # type: ignore[union-attr]
-
-        with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
-            if not use_cuda_graph:
-                NewtonManager._graph = None
-                return
-            if cls._usdrt_stage is None:
-                # No RTX active — use standard Warp capture (cudaStreamCaptureModeGlobal).
-                with wp.ScopedCapture() as capture:
-                    cls._simulate_physics_only()
-                NewtonManager._graph = capture.graph
-                logger.info("Newton CUDA graph captured (standard Warp mode)")
-
-                # TODO: streamline this with base NewtonManager
-                # Kamino: StateKamino.from_newton() lazily allocates body_f_total,
-                # joint_q_prev, and joint_lambdas via wp.clone/wp.zeros during the
-                # first step() inside graph capture. Replay once to pin those
-                # memory-pool addresses before any eager solver.reset() call.
-                wp.capture_launch(cls._graph)
-            else:
-                # RTX is active during initialization — cudaImportExternalMemory and other
-                # non-capturable RTX ops run on background CUDA streams right now.
-                # Defer capture to the first step() call, after RTX is fully initialized
-                # and idle between render frames (clean capture window).
-                NewtonManager._graph = None
-                NewtonManager._graph_capture_pending = True
-                logger.info("Newton CUDA graph capture deferred until first step() (RTX active)")
