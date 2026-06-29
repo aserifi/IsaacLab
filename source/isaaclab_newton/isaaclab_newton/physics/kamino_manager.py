@@ -55,7 +55,7 @@ class NewtonKaminoManager(NewtonManager):
             cls._solver.reset(
                 cls._state_0,
                 world_mask=world_mask,
-                reset_config=cfg_res,
+                config=cfg_res,
             )
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
         else:
