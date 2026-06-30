@@ -52,8 +52,18 @@ class KaminoSolverCfg(NewtonSolverCfg):
     """Whether to enable the forward kinematics solver for state resets.
 
     Required for proper environment resets. The FK solver computes consistent body poses
-    from joint angles after state writes, which is essential for maximal-coordinate solvers.
+    and velocities from the actuated joint coordinates/velocities after state writes, which is
+    essential for maximal-coordinate solvers (closed-loop poses are solved loop-consistent).
     """
+
+    fk_use_regularization: bool = True
+    """Whether to regularize the FK reset solve (Tikhonov term on body poses)."""
+
+    fk_regularization_weight: float = 1e-5
+    """Weight of the FK reset regularizer, used when :attr:`fk_use_regularization` is ``True``."""
+
+    fk_tolerance: float = 1e-5
+    """Convergence tolerance of the FK reset solve."""
 
     sparse_jacobian: bool = False
     """Whether to use sparse Jacobian computation."""
@@ -175,6 +185,7 @@ class KaminoSolverCfg(NewtonSolverCfg):
             CollisionDetectorConfig,
             ConstrainedDynamicsConfig,
             ConstraintStabilizationConfig,
+            ForwardKinematicsSolverConfig,
             PADMMSolverConfig,
         )
         from newton.solvers import SolverKamino
@@ -200,6 +211,11 @@ class KaminoSolverCfg(NewtonSolverCfg):
             collect_solver_info=self.collect_solver_info,
             compute_solution_metrics=self.compute_solution_metrics,
             collision_detector=collision_detector,
+            fk=ForwardKinematicsSolverConfig(
+                use_regularization=self.fk_use_regularization,
+                regularization_weight=self.fk_regularization_weight,
+                tolerance=self.fk_tolerance,
+            ),
             constraints=ConstraintStabilizationConfig(
                 alpha=self.constraints_alpha,
                 beta=self.constraints_beta,

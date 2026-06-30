@@ -32,32 +32,31 @@ class NewtonKaminoManager(NewtonManager):
     # Contains closed-loop articulations
     _has_loop_joints: bool = False
 
+    # Whether the Kamino FK solver reconciles resets from joint coordinates (vs. model-default reset).
+    _uses_fk_solver: bool = False
+
     @classmethod
     def _forward_kamino(cls, world_mask: wp.array | None = None) -> None:
         """Reconcile reset-flagged worlds, dispatching on :attr:`KaminoSolverCfg.use_fk_solver`.
 
-        * FK on: FK-solve bodies from the joint coordinates in the state, then ``eval_fk``
-          overwrites ``body_q`` for a frame-consistent state (needed for closed-loop FK resets
-          to train). ``ResetConfig.from_joints`` also recovers a floating base's root pose/twist
-          from ``joint_q``/``joint_qd`` (and falls back to the model default for a fixed base).
-        * FK off: reset to the model-default reference.
+        Masked by ``world_mask`` so the reset is a no-op when no world is flagged, making the call
+        safe every step.
 
-        Masked by ``world_mask``, so it is a no-op when no world is flagged and safe to call
-        every step.
+        * FK on: a single :meth:`SolverKamino.reset` with :meth:`ResetConfig.from_joints` is the
+          authoritative reconciliation. Kamino's constraint-aware FK solves loop-consistent body
+          poses **and** velocities from the actuated joint coordinates/velocities in the state, and
+          recovers a floating base's root pose/twist from ``joint_q``/``joint_qd``. No
+          :func:`eval_fk` is needed: the solver owns ``body_q``/``body_qd`` for both tree and
+          closed-loop assets. Robust velocity resets for under-actuated/free-base systems rely on
+          :attr:`KaminoSolverCfg.fk_use_regularization` (otherwise the velocity solve is singular).
+        * FK off: reset to the model-default reference. The tree ``body_q`` refresh is then handled
+          by :meth:`forward` / :meth:`step`; closed-loop poses stay solver-owned.
 
         Args:
             world_mask: Per-world reset mask ``(num_worlds,)`` ``wp.bool``; ``None`` reconciles all.
         """
-        use_fk = bool(getattr(getattr(cls._solver, "_config", None), "use_fk_solver", False))
-        if use_fk:
-            cfg_res = SolverKamino.ResetConfig.from_joints()
-            cfg_res.body_velocities = SolverKamino.ResetConfig.ToDefault()
-            cls._solver.reset(
-                cls._state_0,
-                world_mask=world_mask,
-                config=cfg_res,
-            )
-            eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
+        if cls._uses_fk_solver:
+            cls._solver.reset(cls._state_0, world_mask=world_mask, config=SolverKamino.ResetConfig.from_joints())
         else:
             cls._solver.reset(cls._state_0, world_mask=world_mask)
 
@@ -65,16 +64,14 @@ class NewtonKaminoManager(NewtonManager):
     def forward(cls) -> None:
         """Reconcile reset-flagged worlds (no stepping) so ``body_q`` is consistent before reads.
 
-        Used by the explicit-reset path (``env.reset()`` -> ``sim.forward()``). Tree assets get an
-        extra ``eval_fk`` refresh; closed-loop body poses are owned by the solver.
+        Used by the explicit-reset path (``env.reset()`` -> ``sim.forward()``).
         """
         cls._forward_kamino(world_mask=cls._world_reset_mask)
         if cls._world_reset_mask is not None:
             cls._world_reset_mask.zero_()
         if cls._fk_reset_mask is not None:
             cls._fk_reset_mask.zero_()
-        # Closed-loop body poses are owned by the solver.
-        if not cls._has_loop_joints:
+        if not cls._uses_fk_solver and not cls._has_loop_joints:
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, None)
 
     @classmethod
@@ -109,11 +106,11 @@ class NewtonKaminoManager(NewtonManager):
             else:
                 logger.warning("Newton deferred CUDA graph capture failed; using eager execution")
 
-        # Refresh body_q for the collision pipeline on dirtied (tree) articulations.
-        if cls._needs_collision_pipeline and not cls._has_loop_joints:
+        # FK-off path: refresh body_q for the collision pipeline on dirtied (tree) articulations.
+        if not cls._uses_fk_solver and cls._needs_collision_pipeline and not cls._has_loop_joints:
             eval_fk(cls._model, cls._state_0.joint_q, cls._state_0.joint_qd, cls._state_0, cls._fk_reset_mask)
 
-        # Zero both masks after consumption
+        # Zero both masks after consumption.
         NewtonManager._world_reset_mask.zero_()
         NewtonManager._fk_reset_mask.zero_()
 
@@ -135,9 +132,9 @@ class NewtonKaminoManager(NewtonManager):
     def _build_solver(cls, model: Model, solver_cfg: KaminoSolverCfg) -> None:
         """Construct :class:`SolverKamino` and populate the base-class slots.
 
-        Sets :attr:`NewtonManager._needs_collision_pipeline`, caps ``model.rigid_contact_max`` via
-        :attr:`KaminoSolverCfg.max_contacts_per_world`, and detects closed-loop articulations
-        (:attr:`_has_loop_joints`).
+        Sets :attr:`NewtonManager._needs_collision_pipeline` and :attr:`_uses_fk_solver`, caps
+        ``model.rigid_contact_max`` via :attr:`KaminoSolverCfg.max_contacts_per_world`, and detects
+        closed-loop articulations (:attr:`_has_loop_joints`).
         """
         if solver_cfg.max_contacts_per_world is not None:
             model.rigid_contact_max = int(solver_cfg.max_contacts_per_world) * model.world_count
@@ -150,6 +147,7 @@ class NewtonKaminoManager(NewtonManager):
         NewtonManager._solver = SolverKamino(model, solver_cfg.to_solver_config())
         NewtonManager._use_single_state = False
         NewtonManager._needs_collision_pipeline = not solver_cfg.use_collision_detector
+        cls._uses_fk_solver = solver_cfg.use_fk_solver
 
         # Detect closed-loop articulations
         cls._has_loop_joints = False
